@@ -3,8 +3,9 @@ OmniScan Server — API de conversion de documents.
 
 Phase 1 : Word (.docx) -> PDF via LibreOffice en mode headless.
 Phase 2 : PDF -> Word (.docx) via pdf2docx (texte, tableaux et images
-reconstruits par une vraie analyse de mise en page, contrairement à nos
-heuristiques OpenCV faites à la main côté Android).
+reconstruits par une vraie analyse de mise en page), avec un post-traitement
+qui force des bordures visibles sur tous les tableaux — pdf2docx ne
+reproduit pas toujours fidèlement les lignes de grille de l'original.
 
 Lancer en local pour tester :
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -16,11 +17,14 @@ import subprocess
 import tempfile
 import uuid
 
+from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pdf2docx import Converter
 
-app = FastAPI(title="OmniScan Server", version="0.2.0")
+app = FastAPI(title="OmniScan Server", version="0.2.1")
 
 # Dossier de travail temporaire pour les fichiers reçus/générés.
 WORK_DIR = os.path.join(tempfile.gettempdir(), "omniscan_server")
@@ -31,9 +35,37 @@ os.makedirs(WORK_DIR, exist_ok=True)
 CONVERSION_TIMEOUT_SECONDS = 90
 
 
+def force_table_borders(docx_path: str) -> None:
+    """
+    Force des bordures visibles (grille complète) sur tous les tableaux d'un
+    document. pdf2docx crée parfois la bonne structure de tableau (lignes,
+    colonnes) mais sans reproduire fidèlement les lignes de grille visibles
+    de l'original — on les rajoute systématiquement, quitte à ne pas
+    correspondre exactement au style d'origine, pour garantir un tableau
+    lisible et utilisable.
+    """
+    document = Document(docx_path)
+    if not document.tables:
+        return
+
+    for table in document.tables:
+        tbl_pr = table._tbl.tblPr
+        borders = OxmlElement("w:tblBorders")
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            edge_element = OxmlElement(f"w:{edge}")
+            edge_element.set(qn("w:val"), "single")
+            edge_element.set(qn("w:sz"), "4")
+            edge_element.set(qn("w:space"), "0")
+            edge_element.set(qn("w:color"), "000000")
+            borders.append(edge_element)
+        tbl_pr.append(borders)
+
+    document.save(docx_path)
+
+
 @app.get("/health")
 def health_check():
-    """Endpoint simple pour vérifier que le serveur répond (utile pour Render/monitoring)."""
+    """Endpoint simple pour vérifier que le serveur répond (utile pour monitoring)."""
     return {"status": "ok"}
 
 
@@ -47,26 +79,20 @@ async def convert_docx_to_pdf(background_tasks: BackgroundTasks, file: UploadFil
     if not file.filename.lower().endswith(".docx"):
         raise HTTPException(status_code=400, detail="Le fichier doit être un .docx")
 
-    # Dossier isolé par requête pour éviter les collisions entre utilisateurs simultanés.
     request_id = str(uuid.uuid4())
     request_dir = os.path.join(WORK_DIR, request_id)
     os.makedirs(request_dir, exist_ok=True)
 
     input_path = os.path.join(request_dir, "input.docx")
     expected_output_path = os.path.join(request_dir, "input.pdf")
-    # Profil LibreOffice isolé par requête : sans ça, deux conversions simultanées
-    # sur le même serveur peuvent se bloquer mutuellement (verrou de profil).
     lo_profile_dir = os.path.join(request_dir, "lo_profile")
 
-    # Nettoyage programmé pour APRÈS l'envoi de la réponse (le fichier doit encore
-    # exister pendant que FileResponse le transmet).
     background_tasks.add_task(shutil.rmtree, request_dir, ignore_errors=True)
 
     try:
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # LibreOffice headless : convertit et dépose le résultat dans --outdir.
         result = subprocess.run(
             [
                 "soffice",
@@ -101,16 +127,11 @@ async def convert_docx_to_pdf(background_tasks: BackgroundTasks, file: UploadFil
 @app.post("/convert/pdf-to-docx")
 def convert_pdf_to_docx(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
-    Reçoit un fichier .pdf (par exemple un document scanné), le convertit en
-    .docx via pdf2docx, et renvoie le résultat. Texte réel modifiable, vrais
-    tableaux Word, images reconstruites à leur place — une vraie analyse de
-    mise en page, contrairement aux heuristiques OpenCV (une seule grille de
-    tableau détectée par page, seuils à calibrer) qu'on a dû bricoler côté
-    Android.
+    Reçoit un fichier .pdf, le convertit en .docx via pdf2docx, force des
+    bordures visibles sur tous les tableaux détectés, et renvoie le résultat.
 
-    Définie en fonction normale (pas "async def") : pdf2docx est une
-    bibliothèque bloquante — FastAPI l'exécute alors automatiquement dans un
-    thread séparé, pour ne pas geler les autres requêtes en attente.
+    Définie en fonction normale (pas "async def") : pdf2docx est bloquant —
+    FastAPI l'exécute alors automatiquement dans un thread séparé.
     """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Le fichier doit être un .pdf")
@@ -136,6 +157,13 @@ def convert_pdf_to_docx(background_tasks: BackgroundTasks, file: UploadFile = Fi
 
         if not os.path.exists(output_path):
             raise HTTPException(status_code=500, detail="La conversion PDF vers Word a échoué")
+
+        try:
+            force_table_borders(output_path)
+        except Exception as e:
+            # Un échec du post-traitement des bordures ne doit pas faire perdre
+            # toute la conversion : on renvoie quand même le document.
+            print(f"Avertissement : échec du forçage des bordures ({e})")
 
         return FileResponse(
             output_path,
