@@ -149,6 +149,91 @@ async def convert_docx_to_pdf(background_tasks: BackgroundTasks, file: UploadFil
         raise HTTPException(status_code=504, detail="La conversion a dépassé le délai autorisé")
 
 
+@app.post("/compress/pdf")
+def compress_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), quality: int = 50):
+    """
+    Reçoit un fichier .pdf et le recompresse via Ghostscript (ré-encodage des
+    images internes, sous-échantillonnage des résolutions, nettoyage de la
+    structure) — bien plus efficace qu'une compression "maison", car
+    Ghostscript retravaille vraiment le contenu du PDF plutôt que de le
+    manipuler en surface.
+
+    [quality] (0-100, reçu du slider de l'appli) est mappé vers les
+    préréglages standards de Ghostscript :
+        <= 40  -> /screen   (~72 dpi, le plus compact)
+        <= 70  -> /ebook    (~150 dpi, bon compromis)
+        > 70   -> /printer  (~300 dpi, la meilleure qualité)
+    """
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Le fichier doit être un .pdf")
+
+    if quality <= 40:
+        gs_preset = "/screen"
+    elif quality <= 70:
+        gs_preset = "/ebook"
+    else:
+        gs_preset = "/printer"
+
+    request_id = str(uuid.uuid4())
+    request_dir = os.path.join(WORK_DIR, request_id)
+    os.makedirs(request_dir, exist_ok=True)
+
+    input_path = os.path.join(request_dir, "input.pdf")
+    output_path = os.path.join(request_dir, "compressed.pdf")
+
+    background_tasks.add_task(shutil.rmtree, request_dir, ignore_errors=True)
+
+    try:
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        result = subprocess.run(
+            [
+                "gs",
+                "-sDEVICE=pdfwrite",
+                "-dCompatibilityLevel=1.4",
+                f"-dPDFSETTINGS={gs_preset}",
+                "-dNOPAUSE",
+                "-dBATCH",
+                "-dQUIET",
+                f"-sOutputFile={output_path}",
+                input_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=CONVERSION_TIMEOUT_SECONDS,
+        )
+
+        if result.returncode != 0 or not os.path.exists(output_path):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Échec de la compression Ghostscript : {result.stderr.strip()}",
+            )
+
+        # Filet de sécurité : sur un PDF déjà très optimisé, Ghostscript peut
+        # ressortir un fichier légèrement PLUS gros (ré-encodage moins
+        # efficace que l'original). Dans ce cas, autant renvoyer l'original.
+        if os.path.getsize(output_path) >= os.path.getsize(input_path):
+            return FileResponse(
+                input_path,
+                media_type="application/pdf",
+                filename=os.path.splitext(file.filename)[0] + "_compressed.pdf",
+            )
+
+        return FileResponse(
+            output_path,
+            media_type="application/pdf",
+            filename=os.path.splitext(file.filename)[0] + "_compressed.pdf",
+        )
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="La compression a dépassé le délai autorisé")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur de compression : {str(e)}")
+
+
 @app.post("/convert/pdf-to-docx")
 def convert_pdf_to_docx(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
