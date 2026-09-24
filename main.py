@@ -65,6 +65,16 @@ def force_table_borders(docx_path: str) -> None:
 
     for table in document.tables:
         tbl_pr = table._tbl.tblPr
+
+        # pdf2docx insère déjà un élément w:tblBorders (souvent réglé sur
+        # "aucune bordure") — on doit le retirer avant d'ajouter le nôtre,
+        # sinon Word se retrouve avec deux w:tblBorders dans le même
+        # tableau, ce qui est invalide, et applique silencieusement le
+        # premier (celui sans bordures) en ignorant le second.
+        existing_borders = tbl_pr.find(qn("w:tblBorders"))
+        if existing_borders is not None:
+            tbl_pr.remove(existing_borders)
+
         borders = OxmlElement("w:tblBorders")
         for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
             edge_element = OxmlElement(f"w:{edge}")
