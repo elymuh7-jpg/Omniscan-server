@@ -7,6 +7,14 @@ reconstruits par une vraie analyse de mise en page), avec un post-traitement
 qui force des bordures visibles sur tous les tableaux — pdf2docx ne
 reproduit pas toujours fidèlement les lignes de grille de l'original.
 
+pdf2docx s'appuie sur PyMuPDF, qui n'est pas thread-safe : deux conversions
+PDF->Word lancées en même temps dans des threads différents peuvent se
+corrompre silencieusement l'une l'autre. FastAPI exécute chaque endpoint
+"def" (non "async def") dans un thread séparé, donc deux requêtes qui
+arrivent proches dans le temps (ou une requête de conversion qui croise une
+requête de monitoring) peuvent se chevaucher. On sérialise donc toutes les
+conversions PDF->Word avec un verrou (pdf2docx_lock) : une seule à la fois.
+
 Lancer en local pour tester :
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
@@ -15,6 +23,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import uuid
 
 from docx import Document
@@ -24,7 +33,7 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pdf2docx import Converter
 
-app = FastAPI(title="OmniScan Server", version="0.2.1")
+app = FastAPI(title="OmniScan Server", version="0.2.2")
 
 # Dossier de travail temporaire pour les fichiers reçus/générés.
 WORK_DIR = os.path.join(tempfile.gettempdir(), "omniscan_server")
@@ -33,6 +42,11 @@ os.makedirs(WORK_DIR, exist_ok=True)
 # Durée max qu'on laisse à LibreOffice pour convertir un document (secondes).
 # Au-delà, on considère que ça a planté plutôt que de bloquer indéfiniment.
 CONVERSION_TIMEOUT_SECONDS = 90
+
+# Verrou global : garantit qu'une seule conversion pdf2docx (PyMuPDF) tourne
+# à la fois dans tout le processus, quel que soit le nombre de requêtes
+# reçues en parallèle.
+pdf2docx_lock = threading.Lock()
 
 
 def force_table_borders(docx_path: str) -> None:
@@ -45,6 +59,7 @@ def force_table_borders(docx_path: str) -> None:
     lisible et utilisable.
     """
     document = Document(docx_path)
+    print(f"[DEBUG] Nombre de tableaux détectés : {len(document.tables)}")
     if not document.tables:
         return
 
@@ -131,7 +146,10 @@ def convert_pdf_to_docx(background_tasks: BackgroundTasks, file: UploadFile = Fi
     bordures visibles sur tous les tableaux détectés, et renvoie le résultat.
 
     Définie en fonction normale (pas "async def") : pdf2docx est bloquant —
-    FastAPI l'exécute alors automatiquement dans un thread séparé.
+    FastAPI l'exécute alors automatiquement dans un thread séparé. La
+    conversion elle-même est protégée par pdf2docx_lock pour éviter que
+    deux threads touchent PyMuPDF en même temps (voir note en haut du
+    fichier).
     """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Le fichier doit être un .pdf")
@@ -149,11 +167,12 @@ def convert_pdf_to_docx(background_tasks: BackgroundTasks, file: UploadFile = Fi
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        converter = Converter(input_path)
-        try:
-            converter.convert(output_path, start=0, end=None)
-        finally:
-            converter.close()
+        with pdf2docx_lock:
+            converter = Converter(input_path)
+            try:
+                converter.convert(output_path, start=0, end=None)
+            finally:
+                converter.close()
 
         if not os.path.exists(output_path):
             raise HTTPException(status_code=500, detail="La conversion PDF vers Word a échoué")
