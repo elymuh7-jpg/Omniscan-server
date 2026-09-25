@@ -3,3 +3,7 @@ uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 pdf2docx
 python-docx
+img2table
+pytesseract
+pandas
+opencv-python-headless

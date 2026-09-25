@@ -25,15 +25,20 @@ import subprocess
 import tempfile
 import threading
 import uuid
+from typing import List
 
+import pytesseract
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from img2table.document import Image as I2TImage
+from img2table.ocr import TesseractOCR
 from pdf2docx import Converter
+from PIL import Image as PILImage
 
-app = FastAPI(title="OmniScan Server", version="0.2.2")
+app = FastAPI(title="OmniScan Server", version="0.3.0")
 
 # Dossier de travail temporaire pour les fichiers reçus/générés.
 WORK_DIR = os.path.join(tempfile.gettempdir(), "omniscan_server")
@@ -47,6 +52,39 @@ CONVERSION_TIMEOUT_SECONDS = 90
 # à la fois dans tout le processus, quel que soit le nombre de requêtes
 # reçues en parallèle.
 pdf2docx_lock = threading.Lock()
+
+# img2table (via OpenCV) n'est pas garanti thread-safe pour des appels
+# strictement simultanés — même précaution que pour pdf2docx/PyMuPDF.
+table_detection_lock = threading.Lock()
+
+# Instance partagée du moteur OCR Tesseract (français), réutilisée pour
+# toutes les requêtes plutôt que recréée à chaque appel.
+_tesseract_ocr = TesseractOCR(n_threads=1, lang="fra")
+
+
+def _apply_borders_to_table(table) -> None:
+    """
+    Force une grille noire complète (haut, bas, gauche, droite, lignes internes)
+    sur un objet Table python-docx donné. Factorisé pour être réutilisé aussi
+    bien par force_table_borders (tableaux issus de pdf2docx) que par l'endpoint
+    de détection de tableaux dans les scans (tableaux construits cellule par
+    cellule à partir d'img2table).
+    """
+    tbl_pr = table._tbl.tblPr
+
+    existing_borders = tbl_pr.find(qn("w:tblBorders"))
+    if existing_borders is not None:
+        tbl_pr.remove(existing_borders)
+
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        edge_element = OxmlElement(f"w:{edge}")
+        edge_element.set(qn("w:val"), "single")
+        edge_element.set(qn("w:sz"), "4")
+        edge_element.set(qn("w:space"), "0")
+        edge_element.set(qn("w:color"), "000000")
+        borders.append(edge_element)
+    tbl_pr.append(borders)
 
 
 def force_table_borders(docx_path: str) -> None:
@@ -64,26 +102,7 @@ def force_table_borders(docx_path: str) -> None:
         return
 
     for table in document.tables:
-        tbl_pr = table._tbl.tblPr
-
-        # pdf2docx insère déjà un élément w:tblBorders (souvent réglé sur
-        # "aucune bordure") — on doit le retirer avant d'ajouter le nôtre,
-        # sinon Word se retrouve avec deux w:tblBorders dans le même
-        # tableau, ce qui est invalide, et applique silencieusement le
-        # premier (celui sans bordures) en ignorant le second.
-        existing_borders = tbl_pr.find(qn("w:tblBorders"))
-        if existing_borders is not None:
-            tbl_pr.remove(existing_borders)
-
-        borders = OxmlElement("w:tblBorders")
-        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
-            edge_element = OxmlElement(f"w:{edge}")
-            edge_element.set(qn("w:val"), "single")
-            edge_element.set(qn("w:sz"), "4")
-            edge_element.set(qn("w:space"), "0")
-            edge_element.set(qn("w:color"), "000000")
-            borders.append(edge_element)
-        tbl_pr.append(borders)
+        _apply_borders_to_table(table)
 
     document.save(docx_path)
 
@@ -289,3 +308,98 @@ def convert_pdf_to_docx(background_tasks: BackgroundTasks, file: UploadFile = Fi
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur de conversion pdf2docx : {str(e)}")
+
+
+def _extract_page_content(image_path: str) -> tuple[list, str]:
+    """
+    Analyse une image de page scannée : détecte les tableaux (via img2table +
+    Tesseract, qui repère les lignes de grille visuellement dans l'image —
+    contrairement à pdf2docx qui a besoin de données vectorielles absentes
+    d'un scan) et, s'il n'y a pas de tableau, fait un simple OCR du texte.
+
+    Renvoie (tables, texte_brut) : "tables" est une liste de DataFrames
+    pandas (une par tableau détecté), "texte_brut" n'est rempli que si
+    aucun tableau n'a été trouvé sur la page.
+    """
+    with table_detection_lock:
+        doc = I2TImage(src=image_path)
+        extracted = doc.extract_tables(
+            ocr=_tesseract_ocr,
+            implicit_rows=False,
+            borderless_tables=True,
+        )
+
+    if extracted:
+        return [table.df for table in extracted], ""
+
+    # Aucun tableau détecté sur cette page : on se contente d'un OCR classique.
+    raw_text = pytesseract.image_to_string(PILImage.open(image_path), lang="fra")
+    return [], raw_text.strip()
+
+
+@app.post("/ocr/images-to-docx")
+def ocr_images_to_docx(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
+    """
+    Reçoit une ou plusieurs images de pages scannées et renvoie un unique
+    .docx : chaque page dont un tableau a été détecté devient un vrai
+    tableau Word avec bordures (via img2table + Tesseract), chaque page sans
+    tableau devient un simple paragraphe de texte OCR. Remplace, pour
+    l'export Word du scanner, l'extraction ML Kit locale qui ne récupère que
+    du texte brut même quand la page contenait un tableau.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="Aucune image reçue")
+
+    request_id = str(uuid.uuid4())
+    request_dir = os.path.join(WORK_DIR, request_id)
+    os.makedirs(request_dir, exist_ok=True)
+    output_path = os.path.join(request_dir, "scan_result.docx")
+
+    background_tasks.add_task(shutil.rmtree, request_dir, ignore_errors=True)
+
+    try:
+        document = Document()
+
+        for page_index, upload in enumerate(files, start=1):
+            image_path = os.path.join(request_dir, f"page_{page_index}.jpg")
+            with open(image_path, "wb") as buffer:
+                shutil.copyfileobj(upload.file, buffer)
+
+            if len(files) > 1:
+                document.add_heading(f"Page {page_index}", level=2)
+
+            try:
+                tables, raw_text = _extract_page_content(image_path)
+            except Exception as e:
+                print(f"Avertissement : échec de l'analyse de la page {page_index} ({e})")
+                tables, raw_text = [], ""
+
+            if tables:
+                for df in tables:
+                    n_rows, n_cols = df.shape
+                    word_table = document.add_table(rows=n_rows + 1, cols=n_cols)
+                    _apply_borders_to_table(word_table)
+
+                    for col_index, col_name in enumerate(df.columns):
+                        word_table.cell(0, col_index).text = str(col_name)
+                    for row_index in range(n_rows):
+                        for col_index in range(n_cols):
+                            value = df.iat[row_index, col_index]
+                            word_table.cell(row_index + 1, col_index).text = "" if value is None else str(value)
+
+                    document.add_paragraph("")
+            else:
+                document.add_paragraph(raw_text if raw_text else "(Aucun texte détecté sur cette page)")
+
+        document.save(output_path)
+
+        return FileResponse(
+            output_path,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename="scan_result.docx",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de l'analyse du scan : {str(e)}")
