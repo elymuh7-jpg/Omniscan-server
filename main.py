@@ -19,8 +19,6 @@ Lancer en local pour tester :
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 
-import base64
-import json
 import os
 import shutil
 import subprocess
@@ -35,7 +33,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as OAuthCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from img2table.document import Image as I2TImage
@@ -127,18 +125,29 @@ GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 def _get_drive_service():
     """
-    Construit le client Google Drive à partir du compte de service dont la
-    clé JSON est fournie en base64 via la variable d'environnement
-    GOOGLE_SERVICE_ACCOUNT_B64 (jamais commitée, configurée dans Railway).
-    Tous les documents créés vivent dans le Drive de ce compte de service,
-    partagés par lien — aucune connexion Google requise côté utilisateur.
+    Construit le client Google Drive en s'authentifiant AU NOM DU VRAI COMPTE
+    Gmail du développeur (via un refresh token OAuth généré une seule fois),
+    et non via un compte de service. Un compte de service n'a aucun quota de
+    stockage propre sur Drive (limitation Google depuis 2021) : même en
+    créant les fichiers dans un dossier partagé, il reste propriétaire et se
+    heurte à 'storageQuotaExceeded'. En s'authentifiant comme un vrai compte
+    personnel, les documents créés utilisent son quota gratuit (15 Go).
     """
-    creds_b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_B64")
-    if not creds_b64:
-        raise RuntimeError("Variable GOOGLE_SERVICE_ACCOUNT_B64 manquante")
-    info = json.loads(base64.b64decode(creds_b64))
-    credentials = service_account.Credentials.from_service_account_info(
-        info, scopes=GOOGLE_DRIVE_SCOPES
+    client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+    refresh_token = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
+    if not (client_id and client_secret and refresh_token):
+        raise RuntimeError(
+            "Variables GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / "
+            "GOOGLE_OAUTH_REFRESH_TOKEN manquantes"
+        )
+    credentials = OAuthCredentials(
+        token=None,
+        refresh_token=refresh_token,
+        client_id=client_id,
+        client_secret=client_secret,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=GOOGLE_DRIVE_SCOPES,
     )
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
@@ -153,20 +162,13 @@ def _make_link_shareable(service, doc_id: str) -> None:
 
 def _target_folder_metadata() -> dict:
     """
-    Un compte de service n'a aucun quota de stockage propre sur Drive : il
-    faut que les fichiers qu'il crée vivent dans un dossier appartenant à un
-    vrai compte Gmail (partagé en 'Éditeur' avec ce compte de service), sinon
-    Google renvoie 'storageQuotaExceeded'. GOOGLE_DRIVE_FOLDER_ID pointe vers
-    ce dossier partagé.
+    Optionnel : si GOOGLE_DRIVE_FOLDER_ID est défini, range les documents
+    créés par l'appli dans ce dossier plutôt qu'à la racine du Drive
+    (uniquement pour garder les choses organisées — n'est plus nécessaire
+    pour résoudre un souci de quota depuis le passage à l'auth OAuth).
     """
     folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
-    if not folder_id:
-        raise RuntimeError(
-            "Variable GOOGLE_DRIVE_FOLDER_ID manquante : créez un dossier sur "
-            "votre Drive personnel, partagez-le en Éditeur avec l'email du "
-            "compte de service, et renseignez son ID ici."
-        )
-    return {"parents": [folder_id]}
+    return {"parents": [folder_id]} if folder_id else {}
 
 
 @app.post("/gdocs/upload")
