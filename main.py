@@ -151,6 +151,24 @@ def _make_link_shareable(service, doc_id: str) -> None:
     ).execute()
 
 
+def _target_folder_metadata() -> dict:
+    """
+    Un compte de service n'a aucun quota de stockage propre sur Drive : il
+    faut que les fichiers qu'il crée vivent dans un dossier appartenant à un
+    vrai compte Gmail (partagé en 'Éditeur' avec ce compte de service), sinon
+    Google renvoie 'storageQuotaExceeded'. GOOGLE_DRIVE_FOLDER_ID pointe vers
+    ce dossier partagé.
+    """
+    folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
+    if not folder_id:
+        raise RuntimeError(
+            "Variable GOOGLE_DRIVE_FOLDER_ID manquante : créez un dossier sur "
+            "votre Drive personnel, partagez-le en Éditeur avec l'email du "
+            "compte de service, et renseignez son ID ici."
+        )
+    return {"parents": [folder_id]}
+
+
 @app.post("/gdocs/upload")
 def upload_docx_to_google_docs(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
@@ -175,6 +193,7 @@ def upload_docx_to_google_docs(background_tasks: BackgroundTasks, file: UploadFi
         metadata = {
             "name": os.path.splitext(file.filename)[0],
             "mimeType": "application/vnd.google-apps.document",
+            **_target_folder_metadata(),
         }
         media = MediaFileUpload(
             input_path,
@@ -198,12 +217,18 @@ def create_blank_google_doc(title: str = "Nouveau document"):
     try:
         service = _get_drive_service()
         created = service.files().create(
-            body={"name": title, "mimeType": "application/vnd.google-apps.document"},
+            body={
+                "name": title,
+                "mimeType": "application/vnd.google-apps.document",
+                **_target_folder_metadata(),
+            },
             fields="id",
         ).execute()
         doc_id = created["id"]
         _make_link_shareable(service, doc_id)
         return {"docId": doc_id, "editUrl": f"https://docs.google.com/document/d/{doc_id}/edit"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur : {str(e)}")
 
