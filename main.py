@@ -19,6 +19,8 @@ Lancer en local pour tester :
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 
+import base64
+import json
 import os
 import shutil
 import subprocess
@@ -33,6 +35,9 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 from img2table.document import Image as I2TImage
 from img2table.ocr import TesseractOCR
 import cv2
@@ -115,6 +120,120 @@ def force_table_borders(docx_path: str) -> None:
         _apply_borders_to_table(table)
 
     document.save(docx_path)
+
+
+GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+
+def _get_drive_service():
+    """
+    Construit le client Google Drive à partir du compte de service dont la
+    clé JSON est fournie en base64 via la variable d'environnement
+    GOOGLE_SERVICE_ACCOUNT_B64 (jamais commitée, configurée dans Railway).
+    Tous les documents créés vivent dans le Drive de ce compte de service,
+    partagés par lien — aucune connexion Google requise côté utilisateur.
+    """
+    creds_b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_B64")
+    if not creds_b64:
+        raise RuntimeError("Variable GOOGLE_SERVICE_ACCOUNT_B64 manquante")
+    info = json.loads(base64.b64decode(creds_b64))
+    credentials = service_account.Credentials.from_service_account_info(
+        info, scopes=GOOGLE_DRIVE_SCOPES
+    )
+    return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+
+def _make_link_shareable(service, doc_id: str) -> None:
+    service.permissions().create(
+        fileId=doc_id,
+        body={"type": "anyone", "role": "writer"},
+        fields="id",
+    ).execute()
+
+
+@app.post("/gdocs/upload")
+def upload_docx_to_google_docs(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """
+    Reçoit un .docx, l'upload sur Drive en demandant sa conversion en Google
+    Doc natif (mimeType google-apps.document -> Drive fait la conversion
+    lui-même), le rend éditable par quiconque a le lien, et renvoie son URL.
+    """
+    if not file.filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="Le fichier doit être un .docx")
+
+    request_id = str(uuid.uuid4())
+    request_dir = os.path.join(WORK_DIR, request_id)
+    os.makedirs(request_dir, exist_ok=True)
+    input_path = os.path.join(request_dir, "input.docx")
+    background_tasks.add_task(shutil.rmtree, request_dir, ignore_errors=True)
+
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        service = _get_drive_service()
+        metadata = {
+            "name": os.path.splitext(file.filename)[0],
+            "mimeType": "application/vnd.google-apps.document",
+        }
+        media = MediaFileUpload(
+            input_path,
+            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            resumable=False,
+        )
+        created = service.files().create(body=metadata, media_body=media, fields="id").execute()
+        doc_id = created["id"]
+        _make_link_shareable(service, doc_id)
+
+        return {"docId": doc_id, "editUrl": f"https://docs.google.com/document/d/{doc_id}/edit"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de l'envoi vers Google Docs : {str(e)}")
+
+
+@app.post("/gdocs/new")
+def create_blank_google_doc(title: str = "Nouveau document"):
+    """Crée un Google Doc vide pour le bouton 'Nouveau document' de l'appli."""
+    try:
+        service = _get_drive_service()
+        created = service.files().create(
+            body={"name": title, "mimeType": "application/vnd.google-apps.document"},
+            fields="id",
+        ).execute()
+        doc_id = created["id"]
+        _make_link_shareable(service, doc_id)
+        return {"docId": doc_id, "editUrl": f"https://docs.google.com/document/d/{doc_id}/edit"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur : {str(e)}")
+
+
+@app.get("/gdocs/export/{doc_id}")
+def export_google_doc(doc_id: str, background_tasks: BackgroundTasks, fmt: str = "docx"):
+    """Récupère un Google Doc modifié en .docx ou .pdf, pour le rapatrier dans la bibliothèque locale de l'appli."""
+    mime_map = {
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pdf": "application/pdf",
+    }
+    if fmt not in mime_map:
+        raise HTTPException(status_code=400, detail="Format non supporté (docx ou pdf)")
+
+    request_id = str(uuid.uuid4())
+    request_dir = os.path.join(WORK_DIR, request_id)
+    os.makedirs(request_dir, exist_ok=True)
+    output_path = os.path.join(request_dir, f"export.{fmt}")
+    background_tasks.add_task(shutil.rmtree, request_dir, ignore_errors=True)
+
+    try:
+        service = _get_drive_service()
+        request_obj = service.files().export_media(fileId=doc_id, mimeType=mime_map[fmt])
+        with open(output_path, "wb") as f:
+            f.write(request_obj.execute())
+        return FileResponse(output_path, media_type=mime_map[fmt], filename=f"document.{fmt}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur d'export : {str(e)}")
 
 
 @app.get("/health")
