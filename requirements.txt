@@ -7,4 +7,6 @@ img2table
 pytesseract
 pandas
 opencv-python-headless
-rembg
+rembg[cpu]
+google-api-python-client
+google-auth
