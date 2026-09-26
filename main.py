@@ -35,8 +35,11 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from img2table.document import Image as I2TImage
 from img2table.ocr import TesseractOCR
+import cv2
+import numpy as np
 from pdf2docx import Converter
 from PIL import Image as PILImage
+from rembg import new_session, remove
 
 app = FastAPI(title="OmniScan Server", version="0.3.0")
 
@@ -60,6 +63,13 @@ table_detection_lock = threading.Lock()
 # Instance partagée du moteur OCR Tesseract (français), réutilisée pour
 # toutes les requêtes plutôt que recréée à chaque appel.
 _tesseract_ocr = TesseractOCR(n_threads=1, lang="fra")
+
+# rembg (U^2-Net) via onnxruntime n'est pas garanti thread-safe pour des
+# inférences strictement simultanées — même précaution que pour pdf2docx et
+# img2table. Session réutilisée entre requêtes plutôt que recréée à chaque
+# appel (son chargement est coûteux).
+rembg_lock = threading.Lock()
+_rembg_session = new_session("u2net")
 
 
 def _apply_borders_to_table(table) -> None:
@@ -403,3 +413,101 @@ def ocr_images_to_docx(background_tasks: BackgroundTasks, files: List[UploadFile
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lors de l'analyse du scan : {str(e)}")
+
+
+def _order_corners(pts: "np.ndarray") -> "np.ndarray":
+    """Ordonne 4 points en : haut-gauche, haut-droite, bas-droite, bas-gauche."""
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+def _warp_perspective(image: "np.ndarray", pts: "np.ndarray") -> "np.ndarray":
+    rect = _order_corners(pts)
+    (tl, tr, br, bl) = rect
+
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    max_width = max(int(width_a), int(width_b), 100)
+
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+    max_height = max(int(height_a), int(height_b), 100)
+
+    dst = np.array(
+        [[0, 0], [max_width - 1, 0], [max_width - 1, max_height - 1], [0, max_height - 1]],
+        dtype="float32",
+    )
+    matrix = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(image, matrix, (max_width, max_height))
+
+
+@app.post("/scan/segment-crop")
+def segment_crop(file: UploadFile = File(...)):
+    """
+    Reçoit une photo brute d'un document et renvoie une version recadrée et
+    redressée, en isolant d'abord le document du fond via rembg (U^2-Net)
+    avant de chercher son contour — bien plus robuste que la détection de
+    contours par seuillage (Canny) utilisée localement dans l'app, en
+    particulier sur fond de faible contraste ou avec un doigt visible.
+    Si aucun contour fiable n'est trouvé, renvoie l'image d'origine
+    inchangée plutôt que d'échouer.
+    """
+    if not any(file.filename.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png")):
+        raise HTTPException(status_code=400, detail="Le fichier doit être une image (.jpg, .jpeg ou .png)")
+
+    request_id = str(uuid.uuid4())
+    request_dir = os.path.join(WORK_DIR, request_id)
+    os.makedirs(request_dir, exist_ok=True)
+    input_path = os.path.join(request_dir, "input.jpg")
+    output_path = os.path.join(request_dir, "cropped.jpg")
+
+    try:
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        original = PILImage.open(input_path).convert("RGB")
+
+        with rembg_lock:
+            removed = remove(original, session=_rembg_session)
+
+        alpha = np.array(removed)[:, :, 3]
+        _, mask = cv2.threshold(alpha, 10, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        src_np = np.array(original)
+
+        if not contours:
+            # rembg n'a rien isolé de façon fiable : on garde l'image telle quelle
+            # plutôt que de risquer un mauvais recadrage.
+            PILImage.fromarray(src_np).save(output_path, "JPEG", quality=95)
+        else:
+            largest = max(contours, key=cv2.contourArea)
+            peri = cv2.arcLength(largest, True)
+            approx = cv2.approxPolyDP(largest, 0.02 * peri, True)
+
+            if len(approx) == 4:
+                pts = approx.reshape(4, 2).astype("float32")
+                warped = _warp_perspective(src_np, pts)
+            else:
+                # Contour fiable mais pas franchement quadrilatère : un simple
+                # rectangle englobant reste plus sûr qu'une perspective forcée
+                # sur des points mal définis.
+                x, y, w, h = cv2.boundingRect(largest)
+                warped = src_np[y:y + h, x:x + w]
+
+            PILImage.fromarray(warped).save(output_path, "JPEG", quality=95)
+
+        return FileResponse(output_path, media_type="image/jpeg", filename="cropped.jpg")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors du recadrage : {str(e)}")
+    finally:
+        shutil.rmtree(request_dir, ignore_errors=True)

@@ -7,3 +7,4 @@ img2table
 pytesseract
 pandas
 opencv-python-headless
+rembg

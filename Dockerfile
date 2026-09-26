@@ -23,6 +23,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# rembg (U^2-Net, isolation d'objet du fond) télécharge son modèle au premier
+# lancement — on le pré-télécharge ici (maintenant que rembg est installé)
+# pour éviter un délai à froid sur la toute première requête en production.
+RUN python -c "from rembg import new_session; new_session('u2net')"
+
 COPY main.py .
 
 EXPOSE 8000
